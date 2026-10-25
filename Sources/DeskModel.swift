@@ -59,6 +59,7 @@ final class DeskModel: NSObject, ObservableObject, CBCentralManagerDelegate, CBP
     private var controllerMemoryOperationLocalPresets: [Int?] = []
     private var controllerMemoryWriteTarget: DeskCommandTarget?
     private var controllerMemoryWriteSlot: Int?
+    private var controllerMemoryDeleting = false
     private var controllerMemoryWriteAuthorizedAt: TimeInterval?
     private enum InitialConfigRead: Equatable { case base, name }
     private var initialConfigQueue: [InitialConfigRead] = []
@@ -120,6 +121,10 @@ final class DeskModel: NSObject, ObservableObject, CBCentralManagerDelegate, CBP
     var canWriteControllerMemory: Bool {
         canRefreshControllerMemory && controllerMemoryCacheSession == connectionSessionID && controllerMemoryCacheBase == baseHeight &&
         controllerMemoryCache.allSatisfy { $0?.isRecognizedStorageReply == true }
+    }
+    func canDeleteControllerMemory(_ slot: Int) -> Bool {
+        canWriteControllerMemory && controllerMemoryCache.indices.contains(slot) &&
+            controllerMemoryCache[slot]?.confirmedRaw != nil
     }
     var canCancelControllerMemory: Bool { controllerMemoryBusy }
     var canRenameControllerMemory: Bool {
@@ -544,8 +549,9 @@ final class DeskModel: NSObject, ObservableObject, CBCentralManagerDelegate, CBP
     @discardableResult private func write(_ data: Data, to id: String) -> Bool {
         if id == DPI.config {
             let read = data == DPI.readBase || data == DPI.readName || ControllerMemoryProtocol.isReadCommand(data)
-            let authorizedSave = ControllerMemoryProtocol.isSaveCommand(data) && controllerMemorySaveIsAuthorized(data)
-            guard read || authorizedSave else { return false }
+            let mutation = ControllerMemoryProtocol.isSaveCommand(data) || ControllerMemoryProtocol.isDeleteCommand(data)
+            let authorizedMutation = mutation && controllerMemoryMutationIsAuthorized(data)
+            guard read || authorizedMutation else { return false }
         }
         if memoryVerificationOnly {
             let permittedRead = id == DPI.config && (data == DPI.readBase || data == DPI.readName || ControllerMemoryProtocol.isReadCommand(data))
@@ -704,6 +710,7 @@ final class DeskModel: NSObject, ObservableObject, CBCentralManagerDelegate, CBP
         controllerMemoryWriteTarget = nil
         controllerMemoryWriteSlot = nil
         controllerMemoryWriteAuthorizedAt = nil
+        controllerMemoryDeleting = false
         beginControllerMemoryOperation(.readAll, base: base)
     }
     func renameControllerMemory(_ slot: Int) {
@@ -770,7 +777,46 @@ final class DeskModel: NSObject, ObservableObject, CBCentralManagerDelegate, CBP
         controllerMemoryWriteTarget = target
         controllerMemoryWriteSlot = slot
         controllerMemoryWriteAuthorizedAt = clock()
+        controllerMemoryDeleting = false
         beginControllerMemoryOperation(.save(slot: slot, raw: target.raw, expectedPrevious: previous.state), base: base)
+    }
+    func requestControllerMemoryDelete(slot: Int) {
+        guard canDeleteControllerMemory(slot), let previous = controllerMemoryCache[slot],
+              let oldRaw = previous.confirmedRaw, let base = baseHeight, let currentRaw = rawHeight else {
+            controllerMemoryStatus = "请先刷新，选择已读取且非空的档位。"
+            return
+        }
+        let anchor: DeskCommandTarget
+        do {
+            // Freeze the current position only as a safety anchor; deleting a
+            // stored value never creates a movement command.
+            anchor = try DeskCommandTarget(raw: currentRaw, state: commandState, sessionID: connectionSessionID)
+        } catch {
+            controllerMemoryStatus = error.localizedDescription
+            return
+        }
+        let slotTitle = controllerMemorySlotTitle(slot)
+        let oldValue = String(format: "%.2f cm", base + Double(oldRaw) / 100)
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        alert.messageText = "删除\(slotTitle)？"
+        alert.informativeText = "当前值：\(oldValue)\n删除后该档位为空。"
+        alert.addButton(withTitle: "取消")
+        let deleteButton = alert.addButton(withTitle: "删除\(slotTitle)")
+        deleteButton.hasDestructiveAction = true
+        deleteButton.keyEquivalent = ""
+        guard alert.runModal() == .alertSecondButtonReturn else { return }
+        guard canDeleteControllerMemory(slot), anchor.sessionID == connectionSessionID,
+              anchor.baseHeight == baseHeight, let latestRaw = rawHeight,
+              abs(latestRaw - currentRaw) < 15, controllerMemoryCache[slot]?.state == previous.state else {
+            controllerMemoryStatus = "确认期间连接、校准、位置或档位已变化，请刷新后重新确认。"
+            return
+        }
+        controllerMemoryWriteTarget = anchor
+        controllerMemoryWriteSlot = slot
+        controllerMemoryWriteAuthorizedAt = clock()
+        controllerMemoryDeleting = true
+        beginControllerMemoryOperation(.delete(slot: slot, expectedPrevious: previous.state), base: base)
     }
     private func beginControllerMemoryOperation(_ kind: ControllerMemoryOperation.Kind, base: Double) {
         controllerMemoryOperationSession = connectionSessionID
@@ -780,9 +826,10 @@ final class DeskModel: NSObject, ObservableObject, CBCentralManagerDelegate, CBP
         controllerMemoryDidSend = false
         controllerMemoryOperation = ControllerMemoryOperation(kind: kind, expectedBase: base, now: clock())
         controllerMemoryBusy = true
-        controllerMemoryStatus = controllerMemoryWriteSlot == nil ? "读取中…" : "写入中…"
+        controllerMemoryStatus = controllerMemoryWriteSlot == nil ? "读取中…" : (controllerMemoryDeleting ? "删除中…" : "写入中…")
         detail = controllerMemoryStatus
-        log("开始控制器记忆操作 · 会话 \(connectionSessionID) · \(controllerMemoryWriteSlot.map { "写入档位 \($0 + 1)" } ?? "读取四槽")")
+        let action = controllerMemoryDeleting ? "删除" : "写入"
+        log("开始控制器记忆操作 · 会话 \(connectionSessionID) · \(controllerMemoryWriteSlot.map { "\(action)档位 \($0 + 1)" } ?? "读取四槽")")
     }
     func cancelControllerMemoryOperation() {
         cancelControllerMemoryOperation(reason: "用户取消")
@@ -800,16 +847,16 @@ final class DeskModel: NSObject, ObservableObject, CBCentralManagerDelegate, CBP
               now - lastFeedback >= 0, now - lastFeedback <= 1.5 else { return false }
         return abs(raw - initialRaw) < 15
     }
-    private func controllerMemorySaveIsAuthorized(_ data: Data) -> Bool {
+    private func controllerMemoryMutationIsAuthorized(_ data: Data) -> Bool {
         guard !memoryVerificationOnly, controllerMemoryBusy, !controllerMemoryRequiresReconnect,
               controllerMemoryOperation?.writeSent == false,
               let target = controllerMemoryWriteTarget, let slot = controllerMemoryWriteSlot,
               let authorizedAt = controllerMemoryWriteAuthorizedAt,
               clock() - authorizedAt >= 0, clock() - authorizedAt <= 10,
               target.sessionID == connectionSessionID, target.baseHeight == baseHeight,
-              controllerMemoryContextIsValid(at: clock()),
-              ControllerMemoryProtocol.save(slot: slot, raw: target.raw) == data else { return false }
-        return true
+              controllerMemoryContextIsValid(at: clock()) else { return false }
+        if controllerMemoryDeleting { return ControllerMemoryProtocol.delete(slot: slot) == data }
+        return ControllerMemoryProtocol.save(slot: slot, raw: target.raw) == data
     }
     private func pumpControllerMemoryOperation(at now: TimeInterval) {
         guard controllerMemoryBusy else { return }
@@ -839,22 +886,28 @@ final class DeskModel: NSObject, ObservableObject, CBCentralManagerDelegate, CBP
         let valid = controllerMemoryContextIsValid(at: clock())
         let failure = operation.failure ?? (valid ? nil : "完成时设备状态已变化")
         let slot = controllerMemoryWriteSlot
+        let deleting = controllerMemoryDeleting
         controllerMemoryBusy = false
         for line in operation.trace { log("内部记忆 · \(line)") }
         if let failure {
             if controllerMemoryDidSend || operation.writeSent { controllerMemoryRequiresReconnect = true }
+            let action = deleting ? "删除" : "写入"
             let message = operation.writeSent
-                ? "写入可能已生效，但尚未确认：\(failure)。请重新连接并刷新；不会自动重试或回滚。"
+                ? "\(action)可能已生效，但尚未确认：\(failure)。请重新连接并刷新；不会自动重试或回滚。"
                 : "操作未完成：\(failure)" + (controllerMemoryRequiresReconnect ? "。请重新连接后刷新。" : "。")
             if controllerMemoryDidSend || !valid { invalidateControllerMemoryCache(message: message) }
             else { controllerMemoryStatus = message }
         } else {
+            if deleting, let slot {
+                controllerMemoryDrafts[slot] = ""
+                controllerMemoryAutoDrafts[slot] = ""
+            }
             if let slot { controllerMemoryCache[slot] = operation.replies[slot] }
             else { controllerMemoryCache = operation.replies }
             controllerMemoryCacheSession = connectionSessionID
             controllerMemoryCacheBase = baseHeight
             updateControllerMemoryRows()
-            controllerMemoryStatus = slot.map { "\(controllerMemorySlotTitle($0))已保存" } ?? "已读取"
+            controllerMemoryStatus = slot.map { "\(controllerMemorySlotTitle($0))\(deleting ? "已删除" : "已保存")" } ?? "已读取"
             log(controllerMemoryStatus)
         }
         detail = controllerMemoryStatus
@@ -862,6 +915,7 @@ final class DeskModel: NSObject, ObservableObject, CBCentralManagerDelegate, CBP
         controllerMemoryWriteTarget = nil
         controllerMemoryWriteSlot = nil
         controllerMemoryWriteAuthorizedAt = nil
+        controllerMemoryDeleting = false
     }
     private func updateControllerMemoryRows() {
         guard let base = baseHeight else { return }
@@ -987,6 +1041,7 @@ final class DeskModel: NSObject, ObservableObject, CBCentralManagerDelegate, CBP
         if controllerMemoryBusy { cancelControllerMemoryOperation(reason: "蓝牙会话已结束") }
         controllerMemoryOperation = nil
         controllerMemoryWriteTarget = nil; controllerMemoryWriteSlot = nil; controllerMemoryWriteAuthorizedAt = nil
+        controllerMemoryDeleting = false
         controllerMemoryRequiresReconnect = false
         initialConfigQueue = []; initialConfigPending = nil; initialConfigDeadline = nil; initialConfigQueuedAt = nil
         lastInitialConfigReply = -Double.infinity

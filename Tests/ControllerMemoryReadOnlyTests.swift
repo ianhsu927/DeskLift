@@ -72,8 +72,27 @@ final class ControllerMemoryReadOnlyTests: XCTestCase {
         XCTAssertFalse(model.canWriteControllerMemory)
         model.refreshControllerMemory()
         model.requestControllerMemoryWrite(slot: 3, heightText: "68")
+        model.requestControllerMemoryDelete(slot: 0)
+        XCTAssertFalse(model.canDeleteControllerMemory(0))
         XCTAssertFalse(model.controllerMemoryBusy)
         XCTAssertFalse(model.canMove)
+    }
+
+    @MainActor func testDeletingRequiresAConfirmedNonEmptyDeviceSnapshot() {
+        let model = connectedPreviewModel()
+        model.presets = [629, 4_349]
+        for slot in [-1, 0, 1, 2, 3, 4] {
+            XCTAssertFalse(model.canDeleteControllerMemory(slot))
+            // The guard returns before presenting a confirmation or starting
+            // an operation. Preview tests never establish a Bluetooth link.
+            model.requestControllerMemoryDelete(slot: slot)
+        }
+        XCTAssertFalse(model.controllerMemoryBusy)
+        XCTAssertTrue(model.controllerMemoryRows.allSatisfy { !$0.isLoaded })
+        XCTAssertEqual(model.presets, [629, 4_349])
+        XCTAssertEqual(model.height, 68)
+        XCTAssertFalse(model.isActive)
+        XCTAssertNil(model.motionID)
     }
 
     @MainActor func testCalibrationChangeBeforeFirstMemorySendCannotRestoreOldMovementEligibility() {

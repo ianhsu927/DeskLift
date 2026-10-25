@@ -81,6 +81,70 @@ final class ControllerMemoryProtocolTests: XCTestCase {
         }
     }
 
+    func testDeleteCommandsUseExactFormatAndRemainDistinctFromReadAndSave() throws {
+        // Fixed upstream protocol.py / test_protocol.py fixture: slot 2 is
+        // 7f9980020100. This does not send a command or establish hardware support.
+        for slot in 0...3 {
+            let command = try XCTUnwrap(ControllerMemoryProtocol.delete(slot: slot))
+            XCTAssertEqual(command, Data([0x7f, 0x99, 0x80, UInt8(slot), 0x01, 0x00]))
+            XCTAssertTrue(ControllerMemoryProtocol.isDeleteCommand(command))
+            XCTAssertFalse(ControllerMemoryProtocol.isReadCommand(command))
+            XCTAssertFalse(ControllerMemoryProtocol.isSaveCommand(command))
+            XCTAssertFalse(ControllerMemoryProtocol.isDeleteCommand(try XCTUnwrap(ControllerMemoryProtocol.read(slot: slot))))
+            for raw in [0, 3, DPI.maxRaw] {
+                XCTAssertFalse(ControllerMemoryProtocol.isDeleteCommand(try XCTUnwrap(ControllerMemoryProtocol.save(slot: slot, raw: raw))))
+            }
+        }
+    }
+
+    func testDeleteRejectsInvalidSlotsWithoutClamping() {
+        for slot in [-1, 4, 255, Int.min, Int.max] {
+            XCTAssertNil(ControllerMemoryProtocol.delete(slot: slot))
+        }
+    }
+
+    func testDeleteWhitelistRejectsMalformedFramesAndUnrelatedCommands() {
+        let valid = Data([0x7f, 0x99, 0x80, 0x02, 0x01, 0x00])
+        for length in 0..<valid.count {
+            XCTAssertFalse(ControllerMemoryProtocol.isDeleteCommand(Data(valid.prefix(length))))
+        }
+        let rejected: [[UInt8]] = [
+            [0x7f, 0x99, 0x80, 2, 1, 0, 0],
+            [0x7f, 0x99, 0x80, 2, 1, 0, 0, 0],
+            [0x7e, 0x99, 0x80, 2, 1, 0],
+            [0x7f, 0x98, 0x80, 2, 1, 0],
+            [0x7f, 0x99, 0x00, 2, 1, 0],
+            [0x7f, 0x99, 0x81, 2, 1, 0],
+            [0x7f, 0x99, 0x80, 4, 1, 0],
+            [0x7f, 0x99, 0x80, 255, 1, 0],
+            [0x7f, 0x99, 0x80, 2, 0, 0],
+            [0x7f, 0x99, 0x80, 2, 2, 0],
+            [0x7f, 0x99, 0x80, 2, 1, 1],
+            [0x7f, 0x99, 0x80, 2, 1, 255],
+            [0x7f, 0x99, 0x00, 2],
+            [0x7f, 0x81, 0], [0xff, 0x00], [0x47, 0x00],
+            [0x46, 0x00], [0x01, 0x80], [0x03, 0x00]
+        ]
+        for bytes in rejected {
+            XCTAssertFalse(ControllerMemoryProtocol.isDeleteCommand(Data(bytes)))
+        }
+    }
+
+    func testOnlyTheMatchingPendingReadCanRecognizeAnEmptySlotAfterDeletion() throws {
+        for slot in 0...3 {
+            let context = try XCTUnwrap(ControllerMemoryProtocol.ReadContext(slot: slot))
+            let emptyFrame = Data([0x01, 0x03, UInt8(slot), 0x01, 0x00])
+            XCTAssertEqual(context.parse(emptyFrame).state, .empty)
+            XCTAssertNil(context.parse(emptyFrame).confirmedRaw)
+            // A delete request or an echo is not a verification reply.
+            XCTAssertEqual(context.parse(try XCTUnwrap(ControllerMemoryProtocol.delete(slot: slot))).state, .unknown)
+            for otherSlot in 0...3 where otherSlot != slot {
+                let otherContext = try XCTUnwrap(ControllerMemoryProtocol.ReadContext(slot: otherSlot))
+                XCTAssertEqual(otherContext.parse(emptyFrame).state, .unknown)
+            }
+        }
+    }
+
     func testConfirmedRawRequiresRecognizedMetadata() throws {
         let context = try XCTUnwrap(ControllerMemoryProtocol.ReadContext(slot: 0))
         for raw in [0, 4_349, DPI.maxRaw] {

@@ -1,6 +1,6 @@
 import Foundation
 
-// Read/save commands and the empty-slot fixture are documented at revision
+// Read/save/delete commands and the empty-slot fixture are documented at revision
 // b61acfeeb9d716a631aee2ed3acebdfed6f50f15 of ha-linak-dpi1c-control.
 enum ControllerMemoryProtocol {
     enum SlotState: Equatable, Sendable {
@@ -70,6 +70,18 @@ enum ControllerMemoryProtocol {
               bytes[4] == 0x01, bytes[5] == 0x01 else { return false }
         let raw = Int(bytes[6]) | Int(bytes[7]) << 8
         return DPI.target(raw) != nil
+    }
+
+    static func delete(slot: Int) -> Data? {
+        guard (0...3).contains(slot) else { return nil }
+        return Data([0x7f, 0x99, 0x80, UInt8(slot), 0x01, 0x00])
+    }
+
+    static func isDeleteCommand(_ data: Data) -> Bool {
+        let bytes = Array(data)
+        return bytes.count == 6 && bytes[0] == 0x7f && bytes[1] == 0x99
+            && bytes[2] == 0x80 && bytes[3] <= 3
+            && bytes[4] == 0x01 && bytes[5] == 0x00
     }
 
     static func parse(_ data: Data, pending context: ReadContext) -> Reply {

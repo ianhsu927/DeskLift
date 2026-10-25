@@ -76,6 +76,15 @@ struct ControllerMemoryView: View {
                 Spacer(minLength: 8)
                 Text(row.heightText)
                     .monospacedDigit()
+                Button(role: .destructive) {
+                    model.requestControllerMemoryDelete(slot: row.slot)
+                } label: {
+                    Image(systemName: "trash")
+                }
+                .buttonStyle(.borderless)
+                .accessibilityLabel("删除\(model.controllerMemorySlotTitle(row.slot))")
+                .help("清空\(model.controllerMemorySlotTitle(row.slot))")
+                .disabled(!model.canDeleteControllerMemory(row.slot))
             }
 
             HStack(spacing: 6) {

@@ -362,6 +362,261 @@ final class ControllerMemoryOperationTests: XCTestCase {
         assertUncertainFinished(write)
     }
 
+    func testDeleteEverySlotIsSentOnceAndRequiresTwoExplicitEmptyReads() {
+        for slot in 0...3 {
+            // Zero is a populated raw position, never an empty-slot marker.
+            var operation = deleteOperation(slot: slot, raw: 0)
+            let writeAt = prepareDelete(&operation, slot: slot, raw: 0)
+            XCTAssertEqual(operation.nextCommand(at: writeAt), ControllerMemoryProtocol.delete(slot: slot))
+            XCTAssertNil(operation.nextCommand(at: writeAt))
+            operation.didSend(at: writeAt)
+            XCTAssertTrue(operation.writeSent)
+            XCTAssertFalse(operation.outcomeUncertain)
+            XCTAssertNil(operation.nextCommand(at: writeAt + 0.625))
+
+            var readAt = writeAt + 0.75
+            for pass in 0...1 {
+                XCTAssertEqual(operation.nextCommand(at: readAt), ControllerMemoryProtocol.read(slot: slot))
+                XCTAssertFalse(operation.acceptsEmptySlotOneReply)
+                operation.didSend(at: readAt)
+                XCTAssertEqual(operation.acceptsEmptySlotOneReply, slot == 1)
+                operation.receive(emptyFrame(slot: slot), at: readAt + 0.125)
+                XCTAssertFalse(operation.acceptsEmptySlotOneReply)
+                XCTAssertFalse(operation.isFinished)
+                readAt += 0.125 + (pass == 0 ? 0.75 : 0.25)
+            }
+            verifyFinalBaseAndDrain(&operation, at: readAt)
+            XCTAssertNil(operation.failure)
+            XCTAssertFalse(operation.outcomeUncertain)
+            XCTAssertEqual(operation.replies[slot]?.state, .empty)
+            XCTAssertEqual(operation.trace.filter { $0.contains("TX delete-once:") }.count, 1)
+            XCTAssertEqual(operation.trace.filter { $0.contains(" TX ") }.count, 7)
+            XCTAssertFalse(operation.trace.contains { $0.contains("save-once") })
+            XCTAssertNil(operation.nextCommand(at: 100))
+        }
+    }
+
+    func testDeleteRejectsInvalidSlotEmptyUnknownAndUnconfirmedPreviousValues() {
+        let kinds: [ControllerMemoryOperation.Kind] = [
+            .delete(slot: -1, expectedPrevious: .candidate(raw: 0, metadata: [1, 1])),
+            .delete(slot: 4, expectedPrevious: .candidate(raw: 0, metadata: [1, 1])),
+            .delete(slot: 0, expectedPrevious: .empty),
+            .delete(slot: 0, expectedPrevious: .unknown),
+            .delete(slot: 0, expectedPrevious: .candidate(raw: 0, metadata: [1, 0])),
+            .delete(slot: 0, expectedPrevious: .candidate(raw: -1, metadata: [1, 1])),
+            .delete(slot: 0, expectedPrevious: .candidate(raw: 6_501, metadata: [1, 1]))
+        ]
+        for kind in kinds {
+            var operation = ControllerMemoryOperation(kind: kind, expectedBase: 64, now: 0)
+            XCTAssertTrue(operation.isFinished)
+            XCTAssertNotNil(operation.failure)
+            XCTAssertFalse(operation.writeSent)
+            XCTAssertFalse(operation.outcomeUncertain)
+            XCTAssertNil(operation.nextCommand(at: 100))
+        }
+    }
+
+    func testChangedOrAlreadyDeletedPreviousSlotPreventsDelete() {
+        for changed in [valueFrame(slot: 2, raw: 1_001), emptyFrame(slot: 2)] {
+            var operation = deleteOperation()
+            let now = begin(&operation)
+            XCTAssertEqual(operation.nextCommand(at: now), ControllerMemoryProtocol.read(slot: 2))
+            operation.didSend(at: now)
+            operation.receive(changed, at: now + 0.125)
+            XCTAssertTrue(operation.isFinished)
+            XCTAssertTrue(operation.failure?.contains("原档位已改变") == true)
+            XCTAssertFalse(operation.writeSent)
+            XCTAssertFalse(operation.outcomeUncertain)
+            XCTAssertNil(operation.nextCommand(at: 100))
+            XCTAssertFalse(operation.trace.contains { $0.contains("delete-once") })
+        }
+    }
+
+    func testDeleteCannotBeConfirmedByAnyPopulatedPositionIncludingZero() {
+        for raw in [0, 1_000, 6_500] {
+            var operation = deleteOperation()
+            let writeAt = prepareDelete(&operation)
+            XCTAssertNotNil(operation.nextCommand(at: writeAt))
+            operation.didSend(at: writeAt)
+            let readAt = writeAt + 0.75
+            XCTAssertNotNil(operation.nextCommand(at: readAt))
+            operation.didSend(at: readAt)
+            operation.receive(valueFrame(slot: 2, raw: raw), at: readAt + 0.125)
+            assertUncertainFinished(operation)
+            XCTAssertNil(operation.nextCommand(at: readAt + 100))
+            XCTAssertEqual(operation.trace.filter { $0.contains("TX delete-once:") }.count, 1)
+        }
+    }
+
+    func testDeleteSecondReadMustRemainEmptyAndUnsolicitedRepliesDoNotReplaceReads() {
+        var operation = deleteOperation()
+        let writeAt = prepareDelete(&operation)
+        XCTAssertNotNil(operation.nextCommand(at: writeAt))
+        operation.didSend(at: writeAt)
+        operation.receive(emptyFrame(slot: 2), at: writeAt + 0.125)
+        XCTAssertEqual(operation.replies[2]?.confirmedRaw, 1_000)
+        let firstAt = writeAt + 0.75
+        XCTAssertEqual(operation.nextCommand(at: firstAt), ControllerMemoryProtocol.read(slot: 2))
+        operation.didSend(at: firstAt)
+        operation.receive(emptyFrame(slot: 2), at: firstAt + 0.125)
+        let secondAt = firstAt + 0.875
+        XCTAssertEqual(operation.nextCommand(at: secondAt), ControllerMemoryProtocol.read(slot: 2))
+        operation.didSend(at: secondAt)
+        operation.receive(valueFrame(slot: 2, raw: 1_000), at: secondAt + 0.125)
+        assertUncertainFinished(operation)
+        XCTAssertNil(operation.nextCommand(at: 100))
+    }
+
+    func testDeleteWrongSlotAndUnknownRepliesCannotExtendVerificationDeadline() {
+        var operation = deleteOperation()
+        let writeAt = prepareDelete(&operation)
+        XCTAssertNotNil(operation.nextCommand(at: writeAt))
+        operation.didSend(at: writeAt)
+        let readAt = writeAt + 0.75
+        XCTAssertNotNil(operation.nextCommand(at: readAt))
+        operation.didSend(at: readAt)
+        operation.receive(emptyFrame(slot: 3), at: readAt + 0.125)
+        operation.receive(valueFrame(slot: 2, raw: 0, metadata: [0, 0]), at: readAt + 2.875)
+        operation.receive(emptyFrame(slot: 2), at: readAt + 3)
+        assertUncertainFinished(operation)
+        XCTAssertTrue(operation.failure?.contains("应答等待") == true)
+        XCTAssertEqual(operation.replies[2]?.confirmedRaw, 1_000)
+        XCTAssertNil(operation.nextCommand(at: readAt + 100))
+    }
+
+    func testFailedOrUnreportedDeleteOfferCannotBeRetried() {
+        var failed = deleteOperation()
+        let failedAt = prepareDelete(&failed)
+        XCTAssertNotNil(failed.nextCommand(at: failedAt))
+        failed.didFailToSend(at: failedAt)
+        XCTAssertTrue(failed.isFinished)
+        XCTAssertFalse(failed.writeSent)
+        XCTAssertFalse(failed.outcomeUncertain)
+        XCTAssertNil(failed.nextCommand(at: 100))
+        XCTAssertFalse(failed.trace.contains { $0.contains("TX delete-once:") })
+
+        var unreported = deleteOperation()
+        let offeredAt = prepareDelete(&unreported)
+        XCTAssertNotNil(unreported.nextCommand(at: offeredAt))
+        XCTAssertNil(unreported.nextCommand(at: offeredAt + 1))
+        unreported.poll(at: offeredAt + 3)
+        XCTAssertTrue(unreported.isFinished)
+        XCTAssertFalse(unreported.writeSent)
+        XCTAssertFalse(unreported.outcomeUncertain)
+        XCTAssertNil(unreported.nextCommand(at: 100))
+    }
+
+    func testDeleteCancellationBeforeAndAfterSendNeverRetriesOrRestores() {
+        var before = deleteOperation()
+        let beforeAt = prepareDelete(&before)
+        before.cancel(reason: "用户取消", at: beforeAt)
+        XCTAssertTrue(before.isFinished)
+        XCTAssertFalse(before.writeSent)
+        XCTAssertFalse(before.outcomeUncertain)
+        XCTAssertNil(before.nextCommand(at: 100))
+
+        var after = deleteOperation()
+        let afterAt = prepareDelete(&after)
+        XCTAssertNotNil(after.nextCommand(at: afterAt))
+        after.didSend(at: afterAt)
+        after.cancel(reason: "连接变化", at: afterAt + 0.125)
+        assertUncertainFinished(after)
+        after.receive(emptyFrame(slot: 2), at: afterAt + 1)
+        XCTAssertNil(after.nextCommand(at: 100))
+        XCTAssertEqual(after.trace.filter { $0.contains("TX delete-once:") }.count, 1)
+        XCTAssertFalse(after.trace.contains { $0.contains("save-once") })
+    }
+
+    func testDeleteRechecksCalibrationBeforeMutationAndAfterEmptyReads() {
+        var before = deleteOperation()
+        let previousAt = begin(&before)
+        XCTAssertNotNil(before.nextCommand(at: previousAt))
+        before.didSend(at: previousAt)
+        before.receive(valueFrame(slot: 2, raw: 1_000), at: previousAt + 0.125)
+        let baseAt = previousAt + 0.375
+        XCTAssertEqual(before.nextCommand(at: baseAt), DPI.readBase)
+        before.didSend(at: baseAt)
+        before.receive(baseFrame(cents: 6_401), at: baseAt + 0.125)
+        XCTAssertTrue(before.isFinished)
+        XCTAssertFalse(before.writeSent)
+        XCTAssertFalse(before.outcomeUncertain)
+        XCTAssertNil(before.nextCommand(at: 100))
+
+        var after = deleteOperation()
+        let writeAt = prepareDelete(&after)
+        XCTAssertNotNil(after.nextCommand(at: writeAt))
+        after.didSend(at: writeAt)
+        var now = writeAt + 0.75
+        for pass in 0...1 {
+            XCTAssertNotNil(after.nextCommand(at: now))
+            after.didSend(at: now)
+            after.receive(emptyFrame(slot: 2), at: now + 0.125)
+            now += 0.125 + (pass == 0 ? 0.75 : 0.25)
+        }
+        XCTAssertEqual(after.nextCommand(at: now), DPI.readBase)
+        after.didSend(at: now)
+        after.receive(baseFrame(cents: 6_401), at: now + 0.125)
+        assertUncertainFinished(after)
+        XCTAssertNil(after.nextCommand(at: 100))
+    }
+
+    func testDeleteSlotOneEmptyReplyOutsideItsSentReadFailsClosed() {
+        var before = deleteOperation(slot: 1)
+        let beforeAt = prepareDelete(&before, slot: 1)
+        XCTAssertFalse(before.acceptsEmptySlotOneReply)
+        before.receive(emptyFrame(slot: 1), at: beforeAt - 0.125)
+        XCTAssertTrue(before.isFinished)
+        XCTAssertFalse(before.writeSent)
+        XCTAssertNil(before.nextCommand(at: beforeAt))
+
+        var after = deleteOperation(slot: 1)
+        let afterAt = prepareDelete(&after, slot: 1)
+        XCTAssertNotNil(after.nextCommand(at: afterAt))
+        after.didSend(at: afterAt)
+        XCTAssertFalse(after.acceptsEmptySlotOneReply)
+        after.receive(emptyFrame(slot: 1), at: afterAt + 0.125)
+        assertUncertainFinished(after)
+        XCTAssertNil(after.nextCommand(at: 100))
+    }
+
+    func testLateDeleteSendAndInvalidClockPreserveWriteUncertainty() {
+        var late = deleteOperation()
+        let lateAt = prepareDelete(&late)
+        XCTAssertNotNil(late.nextCommand(at: lateAt))
+        late.didSend(at: lateAt + 3)
+        assertUncertainFinished(late)
+        XCTAssertNil(late.nextCommand(at: 100))
+
+        var rollback = deleteOperation()
+        let writeAt = prepareDelete(&rollback)
+        XCTAssertNotNil(rollback.nextCommand(at: writeAt))
+        rollback.didSend(at: writeAt)
+        rollback.poll(at: writeAt - 0.125)
+        assertUncertainFinished(rollback)
+    }
+
+    private func deleteOperation(slot: Int = 2, raw: Int = 1_000) -> ControllerMemoryOperation {
+        ControllerMemoryOperation(kind: .delete(slot: slot,
+            expectedPrevious: .candidate(raw: raw, metadata: [1, 1])), expectedBase: 64, now: 0)
+    }
+
+    private func prepareDelete(_ operation: inout ControllerMemoryOperation,
+                               slot: Int = 2, raw: Int = 1_000) -> TimeInterval {
+        let now = begin(&operation)
+        XCTAssertEqual(operation.nextCommand(at: now), ControllerMemoryProtocol.read(slot: slot))
+        operation.didSend(at: now)
+        operation.receive(valueFrame(slot: slot, raw: raw), at: now + 0.125)
+        XCTAssertFalse(operation.writeSent)
+        XCTAssertFalse(operation.isFinished)
+        let baseAt = now + 0.375
+        XCTAssertEqual(operation.nextCommand(at: baseAt), DPI.readBase)
+        operation.didSend(at: baseAt)
+        operation.receive(baseFrame(), at: baseAt + 0.125)
+        XCTAssertFalse(operation.writeSent)
+        XCTAssertFalse(operation.isFinished)
+        return baseAt + 0.375
+    }
+
     private func begin(_ operation: inout ControllerMemoryOperation) -> TimeInterval {
         XCTAssertEqual(operation.nextCommand(at: 0.75), DPI.readBase)
         operation.didSend(at: 0.75)

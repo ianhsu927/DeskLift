@@ -8,13 +8,14 @@ struct ControllerMemoryOperation {
     enum Kind {
         case readAll
         case save(slot: Int, raw: Int, expectedPrevious: ControllerMemoryProtocol.SlotState)
+        case delete(slot: Int, expectedPrevious: ControllerMemoryProtocol.SlotState)
     }
 
     private enum Request {
         case baseBefore, baseBeforeWrite, baseAfter
         case readAll(round: Int, slot: Int)
         case previous(slot: Int)
-        case save
+        case save, delete
         case verify(slot: Int, pass: Int)
 
         var label: String {
@@ -25,6 +26,7 @@ struct ControllerMemoryOperation {
             case .readAll(let round, let slot): return "round-\(round + 1) slot-\(slot)"
             case .previous(let slot): return "previous slot-\(slot)"
             case .save: return "save-once"
+            case .delete: return "delete-once"
             case .verify(let slot, let pass): return "verify-\(pass + 1) slot-\(slot)"
             }
         }
@@ -36,9 +38,11 @@ struct ControllerMemoryOperation {
             }
         }
 
-        var isSave: Bool {
-            if case .save = self { return true }
-            return false
+        var isPersistentWrite: Bool {
+            switch self {
+            case .save, .delete: return true
+            default: return false
+            }
         }
     }
 
@@ -55,6 +59,28 @@ struct ControllerMemoryOperation {
     private var phase: Phase = .finished
     private var lastObservedAt: TimeInterval?
     private var firstRound: [ControllerMemoryProtocol.Reply?] = Array(repeating: nil, count: 4)
+
+    private var mutationRequest: Request? {
+        switch kind {
+        case .readAll: return nil
+        case .save: return .save
+        case .delete: return .delete
+        }
+    }
+
+    private var mutationSlot: Int? {
+        switch kind {
+        case .readAll: return nil
+        case .save(let slot, _, _), .delete(let slot, _): return slot
+        }
+    }
+
+    private var expectedPrevious: ControllerMemoryProtocol.SlotState? {
+        switch kind {
+        case .readAll: return nil
+        case .save(_, _, let previous), .delete(_, let previous): return previous
+        }
+    }
 
     private(set) var isFinished = false
     private(set) var failure: String?
@@ -86,6 +112,14 @@ struct ControllerMemoryOperation {
                 return
             }
         }
+        if case .delete(let slot, let previous) = kind {
+            let previousReply = ControllerMemoryProtocol.Reply(slot: slot, state: previous, rawFrame: Data())
+            guard ControllerMemoryProtocol.delete(slot: slot) != nil,
+                  previousReply.confirmedRaw != nil else {
+                fail("删除槽位或确认前的非空档位值无效", at: now)
+                return
+            }
+        }
         lastObservedAt = now
         enqueue(.baseBefore, after: 0.75, at: now)
     }
@@ -96,11 +130,11 @@ struct ControllerMemoryOperation {
               case .queued(let request, let notBefore, let deadline) = phase,
               now >= notBefore,
               let data = command(for: request) else { return nil }
-        if request.isSave {
+        if request.isPersistentWrite {
             // An offered persistent write is never returned a second time,
             // even when a caller forgets to report a failed send.
             phase = .writeOffered(deadline: deadline)
-            record("OFFERED save-once: \(Self.hex(data))", at: now)
+            record("OFFERED \(request.label): \(Self.hex(data))", at: now)
         }
         return data
     }
@@ -111,7 +145,7 @@ struct ControllerMemoryOperation {
         if !isFinished {
             switch phase {
             case .writeOffered: writeSent = true
-            case .queued(let request, _, _) where request.isSave: writeSent = true
+            case .queued(let request, _, _) where request.isPersistentWrite: writeSent = true
             default: break
             }
         }
@@ -119,11 +153,12 @@ struct ControllerMemoryOperation {
         guard !isFinished else { return }
         switch phase {
         case .writeOffered:
-            guard let data = command(for: .save), case .save(let slot, _, _) = kind else {
+            guard let request = mutationRequest, let slot = mutationSlot,
+                  let data = command(for: request) else {
                 fail("拒绝了无效的内部记忆写入", at: now)
                 return
             }
-            record("TX save-once: \(Self.hex(data))", at: now)
+            record("TX \(request.label): \(Self.hex(data))", at: now)
             enqueue(.verify(slot: slot, pass: 0), after: 0.75, at: now)
         case .queued(let request, let notBefore, _):
             guard let data = command(for: request) else {
@@ -131,7 +166,7 @@ struct ControllerMemoryOperation {
                 return
             }
             record("TX \(request.label): \(Self.hex(data))", at: now)
-            guard !request.isSave, now >= notBefore else {
+            guard !request.isPersistentWrite, now >= notBefore else {
                 fail("命令未按允许的发送时序执行", at: now)
                 return
             }
@@ -154,7 +189,7 @@ struct ControllerMemoryOperation {
         switch phase {
         case .writeOffered:
             fail("写入请求未发送，请重新确认后再试；不会自动重试", at: now)
-        case .queued(let request, _, _) where request.isSave:
+        case .queued(let request, _, _) where request.isPersistentWrite:
             fail("写入请求未发送，请重新确认后再试；不会自动重试", at: now)
         case .queued(let request, _, _):
             record("NOT-SENT \(request.label); original send deadline retained", at: now)
@@ -195,11 +230,16 @@ struct ControllerMemoryOperation {
                 phase = .draining(until: until)
                 record("DRAIN until \(until)", at: now)
             } else if case .baseBeforeWrite = request {
-                enqueue(.save, after: 0.25, at: now)
+                guard let mutationRequest else {
+                    fail("没有已确认的内部记忆变更", at: now)
+                    return
+                }
+                enqueue(mutationRequest, after: 0.25, at: now)
             } else {
                 switch kind {
                 case .readAll: enqueue(.readAll(round: 0, slot: 0), after: 0.25, at: now)
                 case .save(let slot, _, _): enqueue(.previous(slot: slot), after: 0.25, at: now)
+                case .delete(let slot, _): enqueue(.previous(slot: slot), after: 0.25, at: now)
                 }
             }
         case .readAll(let round, let slot):
@@ -223,7 +263,7 @@ struct ControllerMemoryOperation {
         case .previous(let slot):
             guard let reply = recognizedReply(data, slot: slot) else { return }
             replies[slot] = reply
-            guard case .save(_, _, let previous) = kind, reply.state == previous else {
+            guard let previous = expectedPrevious, reply.state == previous else {
                 fail("确认后的原档位已改变，未执行写入", at: now)
                 return
             }
@@ -231,7 +271,13 @@ struct ControllerMemoryOperation {
         case .verify(let slot, let pass):
             guard let reply = recognizedReply(data, slot: slot) else { return }
             replies[slot] = reply
-            guard case .save(_, let raw, _) = kind, reply.confirmedRaw == raw else {
+            let matches: Bool
+            switch kind {
+            case .save(_, let raw, _): matches = reply.confirmedRaw == raw
+            case .delete: matches = reply.state == .empty
+            case .readAll: matches = false
+            }
+            guard matches else {
                 fail("写后回读与目标不一致，结果不确定", at: now)
                 return
             }
@@ -240,7 +286,7 @@ struct ControllerMemoryOperation {
             } else {
                 enqueue(.baseAfter, after: 0.25, at: now)
             }
-        case .save:
+        case .save, .delete:
             fail("写入不能作为待应答读取请求", at: now)
         }
     }
@@ -281,16 +327,22 @@ struct ControllerMemoryOperation {
 
     private func command(for request: Request) -> Data? {
         let data: Data?
-        if request.isSave {
-            guard case .save(let slot, let raw, _) = kind else { return nil }
-            data = ControllerMemoryProtocol.save(slot: slot, raw: raw)
+        if request.isPersistentWrite {
+            switch (request, kind) {
+            case (.save, .save(let slot, let raw, _)):
+                data = ControllerMemoryProtocol.save(slot: slot, raw: raw)
+            case (.delete, .delete(let slot, _)):
+                data = ControllerMemoryProtocol.delete(slot: slot)
+            default: return nil
+            }
         } else if let slot = request.slot {
             data = ControllerMemoryProtocol.read(slot: slot)
         } else {
             data = DPI.readBase
         }
         guard let data, data == DPI.readBase || ControllerMemoryProtocol.isReadCommand(data)
-                || (request.isSave && ControllerMemoryProtocol.isSaveCommand(data)) else { return nil }
+                || (request.isPersistentWrite && (ControllerMemoryProtocol.isSaveCommand(data)
+                    || ControllerMemoryProtocol.isDeleteCommand(data))) else { return nil }
         return data
     }
 
@@ -298,7 +350,7 @@ struct ControllerMemoryOperation {
         let notBefore = now + delay
         let deadline = notBefore + 3
         guard notBefore.isFinite, notBefore > now, deadline.isFinite, deadline > notBefore,
-              !request.isSave || !writeSent else {
+              !request.isPersistentWrite || !writeSent else {
             fail("无法建立下一条命令或禁止重复写入", at: now)
             return
         }
