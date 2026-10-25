@@ -1,6 +1,7 @@
 import AppKit
 import SwiftUI
 import Combine
+import OSLog
 
 final class InterfaceState: ObservableObject {
     @Published var showingDevices = false
@@ -11,6 +12,7 @@ struct MainView: View {
     @ObservedObject var interfaceState: InterfaceState
     var showDiagnostics: () -> Void
     var showControllerMemory: () -> Void
+    var showLight: () -> Void
 
     var body: some View {
         VStack(spacing: 0) {
@@ -59,6 +61,12 @@ struct MainView: View {
         .background(Color(nsColor: .windowBackgroundColor))
         .frame(minWidth: 460, minHeight: 520)
         .toolbar {
+            ToolbarItem(placement: .primaryAction) {
+                Button(action: showLight) {
+                    Label("挂灯", systemImage: "lightbulb")
+                }
+                .help("控制米家显示器挂灯 2")
+            }
             ToolbarItem(placement: .primaryAction) {
                 Button {
                     if model.isActive { model.stop("打开设备面板，已停止升降") }
@@ -384,16 +392,20 @@ final class StatusMenuControls: NSView {
     @objc private func standPressed() { recall(1) }
 }
 
+@MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMenuDelegate {
     let model = DeskModel(preview: CommandLine.arguments.contains("--preview"),
                           memoryVerificationOnly: CommandLine.arguments.contains("--verify-controller-memory"))
     private let interfaceState = InterfaceState()
+    private let lightModel = MijiaLightModel(preview: CommandLine.arguments.contains("--preview"),
+                                            readOnly: CommandLine.arguments.contains("--verify-controller-memory"))
     var window: NSWindow!
     var statusItem: NSStatusItem!
     var eventMonitor: Any?
     var diagnosticsWindow: NSWindow?
     private var siriSettingsWindow: NSWindow?
     private var controllerMemoryWindow: NSWindow?
+    private var lightWindow: NSWindow?
     private let statusMenu = NSMenu()
     private let statusHeightItem = NSMenuItem(title: "当前高度 —", action: nil, keyEquivalent: "")
     private let statusSummary = StatusMenuSummaryView()
@@ -416,7 +428,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         window.autorecalculatesKeyViewLoop = true
         let host = NSHostingView(rootView: MainView(model: model, interfaceState: interfaceState,
             showDiagnostics: { [weak self] in self?.showDiagnostics() },
-            showControllerMemory: { [weak self] in self?.showControllerMemory() }))
+            showControllerMemory: { [weak self] in self?.showControllerMemory() },
+            showLight: { [weak self] in self?.showLight() }))
         host.sceneBridgingOptions = [.toolbars]
         window.contentView = host
         window.center(); window.makeKeyAndOrderFront(nil)
@@ -465,6 +478,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         let controlsItem = NSMenuItem()
         controlsItem.view = statusControls
         statusMenu.addItem(controlsItem)
+        statusMenu.addItem(.separator())
+        statusMenu.addItem(withTitle: "米家挂灯…", action: #selector(showLight), keyEquivalent: "").target = self
         statusStopItem = statusMenu.addItem(withTitle: "停止升降", action: #selector(stopDesk), keyEquivalent: ".")
         statusStopItem.target = self
         statusStopItem.isHidden = true
@@ -507,7 +522,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
             guard let self, base != self.model.baseHeight else { return }
             self.heightDuration.observe(height: nil, isMoving: false, now: self.clock())
         }.store(in: &statusSubscriptions)
-        statusClock = Timer(timeInterval: 1, repeats: true) { [weak self] _ in self?.refreshStatusMenu() }
+        statusClock = Timer(timeInterval: 1, repeats: true) { [weak self] _ in
+            // Registered only on RunLoop.main below.
+            MainActor.assumeIsolated { self?.refreshStatusMenu() }
+        }
         RunLoop.main.add(statusClock!, forMode: .common)
         NSWorkspace.shared.notificationCenter.publisher(for: NSWorkspace.didActivateApplicationNotification)
             .receive(on: DispatchQueue.main)
@@ -631,6 +649,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         windows.addItem(withTitle: "连接诊断", action: #selector(showDiagnostics), keyEquivalent: "2").target = self
         windows.addItem(withTitle: "菜单栏控制", action: #selector(showMenuBarPanel), keyEquivalent: "3").target = self
         windows.addItem(withTitle: "控制器记忆", action: #selector(showControllerMemory), keyEquivalent: "4").target = self
+        windows.addItem(withTitle: "米家挂灯", action: #selector(showLight), keyEquivalent: "5").target = self
         windows.addItem(.separator())
         windows.addItem(withTitle: "最小化", action: #selector(NSWindow.performMiniaturize(_:)), keyEquivalent: "m")
         NSApp.windowsMenu = windows
@@ -638,6 +657,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
     }
     @objc func showWindow() { closeStatusMenu(); window.makeKeyAndOrderFront(nil); NSApp.activate(ignoringOtherApps: true) }
     @objc func stopDesk() { model.stop(); statusControls.update(model) }
+    @objc func showLight() {
+        closeStatusMenu()
+        if model.isActive { model.stop("打开挂灯面板，已停止升降") }
+        if lightWindow == nil {
+            let panel = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 460, height: 540),
+                                 styleMask: [.titled, .closable, .miniaturizable], backing: .buffered, defer: false)
+            panel.title = "米家挂灯"
+            panel.isReleasedWhenClosed = false
+            panel.delegate = self
+            panel.toolbarStyle = .unifiedCompact
+            let host = NSHostingView(rootView: MijiaLightView(model: lightModel))
+            host.sceneBridgingOptions = [.toolbars]
+            panel.contentView = host
+            panel.center()
+            lightWindow = panel
+        }
+        lightWindow?.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
+        lightModel.refresh()
+    }
     @objc func showControllerMemory() {
         closeStatusMenu()
         if model.isActive { model.stop("打开控制器记忆，已停止升降") }
@@ -706,7 +745,60 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
     }
 }
 
-let app = NSApplication.shared
-let delegate = AppDelegate()
-app.delegate = delegate
-app.run()
+// Run one-time credential migration in this signed application, before creating
+// the app delegate or Bluetooth manager. Input and credentials are never logged.
+if let index = CommandLine.arguments.firstIndex(of: "--import-mijia-light-credentials") {
+    guard index + 1 < CommandLine.arguments.count else {
+        fputs("缺少本地挂灯凭据文件路径。\n", stderr)
+        exit(EXIT_FAILURE)
+    }
+    do {
+        try KeychainMijiaLightStore.importDiagnosticFile(CommandLine.arguments[index + 1])
+        print("米家挂灯凭据已保存到本机钥匙串。")
+        exit(EXIT_SUCCESS)
+    } catch {
+        fputs("无法导入挂灯凭据，请检查文件与登录钥匙串权限。\n", stderr)
+        exit(EXIT_FAILURE)
+    }
+}
+
+// Native, read-only setup verification. It creates neither windows nor a desk
+// Bluetooth manager, and exits after a bounded query to the configured lamp.
+if CommandLine.arguments.contains("--verify-mijia-light") {
+    Task.detached {
+        do {
+            guard let saved = try KeychainMijiaLightStore().load() else {
+                throw MijiaLightStoreError.invalidRecord
+            }
+            let reading = try await MijiaLightClient().read(saved)
+            let result: [String: Any] = ["model": "xiaomi.light.bar2", "host": saved.host,
+                "device_id": reading.deviceID, "firmware": reading.firmware,
+                "on": reading.state.isOn, "brightness": reading.state.brightness,
+                "color_temperature": reading.state.colorTemperature, "mode": reading.state.mode]
+            let data = try JSONSerialization.data(withJSONObject: result, options: [.sortedKeys])
+            print(String(decoding: data, as: UTF8.self))
+            exit(EXIT_SUCCESS)
+        } catch {
+            fputs("挂灯本地状态验证失败，未发送控制命令。\n", stderr)
+            exit(EXIT_FAILURE)
+        }
+    }
+    let deadline = DispatchSemaphore(value: 0)
+    _ = deadline.wait(timeout: .now() + 20)
+    fputs("挂灯本地状态验证超时。\n", stderr)
+    exit(EXIT_FAILURE)
+}
+
+// Keep CLI pipe semantics above intact. Only the long-lived graphical process
+// treats broken output/communication pipes as I/O failures instead of exiting.
+if !GUIProcessSignals.configure() {
+    Logger(subsystem: "local.ian.desklift", category: "startup")
+        .fault("Unable to configure GUI broken-pipe handling")
+}
+
+MainActor.assumeIsolated {
+    let app = NSApplication.shared
+    let delegate = AppDelegate()
+    app.delegate = delegate
+    withExtendedLifetime(delegate) { app.run() }
+}

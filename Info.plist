@@ -7,11 +7,12 @@
 <key>CFBundleExecutable</key><string>DeskLift</string>
 <key>CFBundlePackageType</key><string>APPL</string>
 <key>CFBundleShortVersionString</key><string>1.0</string>
-<key>CFBundleVersion</key><string>7</string>
+<key>CFBundleVersion</key><string>9</string>
 <key>CFBundleIconFile</key><string>AppIcon</string>
 <key>LSMinimumSystemVersion</key><string>14.0</string>
 <key>NSHighResolutionCapable</key><true/>
 <key>NSBluetoothAlwaysUsageDescription</key><string>DeskLift 使用蓝牙查找并连接你的 LINAK DPI1C 升降桌，读取高度，并在你操作时控制升降。</string>
 <key>NSBluetoothPeripheralUsageDescription</key><string>连接 LINAK DPI1C 升降桌并控制高度。</string>
+<key>NSLocalNetworkUsageDescription</key><string>DeskLift 通过局域网直接读取并控制你配置的米家显示器挂灯 2。</string>
 <key>NSHumanReadableCopyright</key><string>DeskLift 2026. Independent tool. Protocol portions © 2026 KKQQ (MIT).</string>
 </dict></plist>

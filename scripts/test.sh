@@ -4,6 +4,10 @@ cd "${0:A:h}/.."
 export DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer
 case "${1:-}" in
   "")
+    mkdir -p build/module-cache
+    swiftc -swift-version 5 -module-cache-path build/module-cache \
+      Sources/GUIProcessSignals.swift Tests/LauncherSignalFixture/main.swift -o build/launcher-signal-fixture
+    python3 scripts/test-launcher-signals.py build/launcher-signal-fixture
     xcodebuild -quiet -project DeskLift.xcodeproj -scheme DeskLift \
       -configuration Debug -destination 'platform=macOS,arch=arm64' \
       -derivedDataPath build/DerivedData -parallel-testing-enabled NO test
