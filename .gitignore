@@ -1,0 +1,20 @@
+build/
+deliverables/
+.DS_Store
+**/xcuserdata/
+*.xcuserstate
+
+# Machine-specific instructions and local development notes
+/AGENTS.md
+/.agents/
+/.codex/
+/.aws/
+/*-20??????-??????.md
+
+# Local credentials and signing material
+.env
+.env.*
+*.p12
+*.pfx
+*.mobileprovision
+*.provisionprofile
