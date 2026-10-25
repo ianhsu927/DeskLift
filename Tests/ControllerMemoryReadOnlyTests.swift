@@ -119,6 +119,42 @@ final class ControllerMemoryReadOnlyTests: XCTestCase {
         XCTAssertEqual(model.baseHeight, 62) // never install a false 0.01 cm base
     }
 
+    @MainActor func testReconnectReasonSurvivesStopAndRefreshAttempts() {
+        let model = connectedPreviewModel()
+        model.refreshControllerMemory()
+        model.receiveControllerConfiguration(Data([1, 3, 1, 1, 0]))
+        let reason = "收到无法区分记忆与校准的回复，请重新连接。"
+        XCTAssertEqual(model.status, "需要重新连接")
+        XCTAssertEqual(model.detail, reason)
+
+        // No peripheral is created: the presentation priority is applied before
+        // the transport guard, while real connected devices still receive stop.
+        model.stop()
+        model.refreshControllerMemory()
+        XCTAssertFalse(model.shortcutStop())
+        model.stop("控制面板已关闭，升降已停止")
+        XCTAssertEqual(model.status, "需要重新连接")
+        XCTAssertEqual(model.detail, reason)
+        XCTAssertNil(model.height)
+        XCTAssertFalse(model.canMove)
+        XCTAssertFalse(model.canWriteControllerMemory)
+        XCTAssertFalse(model.isActive)
+    }
+
+    @MainActor func testDisconnectClearsReconnectPresentation() {
+        let model = connectedPreviewModel()
+        model.refreshControllerMemory()
+        model.receiveControllerConfiguration(Data([1, 3, 1, 0x9c, 0x18]))
+        XCTAssertEqual(model.status, "需要重新连接")
+        XCTAssertTrue(model.detail.contains("高度基准已改变"))
+
+        model.disconnect()
+        model.stop()
+        XCTAssertEqual(model.status, "尚未连接")
+        XCTAssertEqual(model.detail, "点击搜索桌子重新连接。")
+        XCTAssertFalse(model.canMove)
+    }
+
     @MainActor func testCancelBeforeAnyReadIsSentDoesNotPoisonTheConnection() {
         let model = connectedPreviewModel()
         model.refreshControllerMemory()

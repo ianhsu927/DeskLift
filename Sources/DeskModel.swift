@@ -51,6 +51,7 @@ final class DeskModel: NSObject, ObservableObject, CBCentralManagerDelegate, CBP
     private var controllerMemoryCacheBase: Double?
     private var controllerMemoryOperation: ControllerMemoryOperation?
     private var controllerMemoryRequiresReconnect = false
+    private var controllerMemoryReconnectReason: String?
     private var controllerMemoryHasUsedProtocol = false
     private var controllerMemoryDidSend = false
     private var controllerMemoryOperationSession: UUID?
@@ -458,10 +459,21 @@ final class DeskModel: NSObject, ObservableObject, CBCentralManagerDelegate, CBP
         return true
     }
     private func abortControllerMemoryForUntrustedConfiguration(_ reason: String) {
-        controllerMemoryRequiresReconnect = true
-        invalidateControllerMemoryCache(message: "\(reason)，请重新连接。")
+        let message = "\(reason)，请重新连接。"
+        requireControllerMemoryReconnect(message)
+        invalidateControllerMemoryCache(message: message)
         controllerMemoryOperation?.cancel(reason: reason, at: clock())
         finishControllerMemoryOperation()
+    }
+    private func requireControllerMemoryReconnect(_ message: String, replacingReason: Bool = false) {
+        controllerMemoryRequiresReconnect = true
+        if controllerMemoryReconnectReason == nil || replacingReason { controllerMemoryReconnectReason = message }
+        presentControllerMemoryReconnectRequirement()
+    }
+    private func presentControllerMemoryReconnectRequirement() {
+        guard controllerMemoryRequiresReconnect else { return }
+        status = "需要重新连接"
+        detail = controllerMemoryReconnectReason ?? "配置状态尚未确认，请断开并重新连接。"
     }
     private func queryConfig() {
         guard peripheral?.state == .connected, !memoryReadQuarantined, !controllerMemoryBusy,
@@ -503,8 +515,9 @@ final class DeskModel: NSObject, ObservableObject, CBCentralManagerDelegate, CBP
         // After memory I/O, never accept that ambiguity as new calibration.
         if controllerMemoryHasUsedProtocol && memoryShaped {
             if DPI.base(data) != nil {
-                controllerMemoryRequiresReconnect = true
-                invalidateControllerMemoryCache(message: "收到歧义配置回复，请断开并重新连接。")
+                let message = "收到歧义配置回复，请断开并重新连接。"
+                requireControllerMemoryReconnect(message)
+                invalidateControllerMemoryCache(message: message)
                 stop("配置回复无法区分记忆与校准，已停止并要求重新连接")
             } else { log("忽略没有待处理请求的记忆回复") }
             return
@@ -588,17 +601,24 @@ final class DeskModel: NSObject, ObservableObject, CBCentralManagerDelegate, CBP
         pulse()
         return .started(id)
     }
-    func stop(_ reason: String = "已停止") {
+    func stop(_ reason: String = "升降已停止") {
         if controllerMemoryBusy { cancelControllerMemoryOperation(reason: reason) }
         if memoryVerificationRunning { finishMemoryVerification(failure: "验证已取消：\(reason)") }
         if let id = motionID {
             lastMotionResult = MotionResult(id: id, reachedTarget: reason == "已到达目标高度", reason: reason)
         }
         motion = nil; motionID = nil; activeTarget = nil
+        // A stop must still reach the controller, but must not hide the reason
+        // movement is locked until a new, calibrated connection is established.
+        presentControllerMemoryReconnectRequirement()
         guard peripheral?.state == .connected else { return }
         stopPending = true
         cooldownUntil = clock() + 0.8
-        status = ready ? "已连接" : status; detail = reason; log(reason)
+        if !controllerMemoryRequiresReconnect {
+            status = ready ? "已连接" : status
+            detail = reason
+        }
+        log(reason)
         // A stop has priority over future movement writes. Never queue a stale target.
         flushStop()
     }
@@ -890,13 +910,16 @@ final class DeskModel: NSObject, ObservableObject, CBCentralManagerDelegate, CBP
         controllerMemoryBusy = false
         for line in operation.trace { log("内部记忆 · \(line)") }
         if let failure {
-            if controllerMemoryDidSend || operation.writeSent { controllerMemoryRequiresReconnect = true }
+            let requiresReconnect = controllerMemoryRequiresReconnect || controllerMemoryDidSend || operation.writeSent
             let action = deleting ? "删除" : "写入"
             let message = operation.writeSent
                 ? "\(action)可能已生效，但尚未确认：\(failure)。请重新连接并刷新；不会自动重试或回滚。"
-                : "操作未完成：\(failure)" + (controllerMemoryRequiresReconnect ? "。请重新连接后刷新。" : "。")
+                : "操作未完成：\(failure)" + (requiresReconnect ? "。请重新连接后刷新。" : "。")
             if controllerMemoryDidSend || !valid { invalidateControllerMemoryCache(message: message) }
             else { controllerMemoryStatus = message }
+            // If a mutation left the Mac, the final unconfirmed-result warning
+            // takes priority over an earlier generic calibration/feedback error.
+            if requiresReconnect { requireControllerMemoryReconnect(message, replacingReason: operation.writeSent) }
         } else {
             if deleting, let slot {
                 controllerMemoryDrafts[slot] = ""
@@ -911,6 +934,7 @@ final class DeskModel: NSObject, ObservableObject, CBCentralManagerDelegate, CBP
             log(controllerMemoryStatus)
         }
         detail = controllerMemoryStatus
+        presentControllerMemoryReconnectRequirement()
         controllerMemoryOperation = nil
         controllerMemoryWriteTarget = nil
         controllerMemoryWriteSlot = nil
@@ -1043,6 +1067,7 @@ final class DeskModel: NSObject, ObservableObject, CBCentralManagerDelegate, CBP
         controllerMemoryWriteTarget = nil; controllerMemoryWriteSlot = nil; controllerMemoryWriteAuthorizedAt = nil
         controllerMemoryDeleting = false
         controllerMemoryRequiresReconnect = false
+        controllerMemoryReconnectReason = nil
         initialConfigQueue = []; initialConfigPending = nil; initialConfigDeadline = nil; initialConfigQueuedAt = nil
         lastInitialConfigReply = -Double.infinity
         invalidateControllerMemoryCache(message: "未读取")

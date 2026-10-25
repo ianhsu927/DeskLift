@@ -732,9 +732,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
     @objc func about() {
         NSApp.orderFrontStandardAboutPanel(options: [.applicationName: "DeskLift", .applicationVersion: "1.0", .credits: NSAttributedString(string: "原生 macOS · LINAK DPI1C 蓝牙控制\n独立工具，与 LINAK 无隶属关系。\n协议参考 KKQQ 开源项目（MIT）。")])
     }
-    func windowShouldClose(_ sender: NSWindow) -> Bool { model.stop("控制面板已关闭，升降已停止"); sender.orderOut(nil); return false }
+    func windowShouldClose(_ sender: NSWindow) -> Bool {
+        if sender === window {
+            model.stop("控制面板已关闭，升降已停止")
+        } else if sender === controllerMemoryWindow {
+            model.cancelControllerMemoryOperation()
+        }
+        sender.orderOut(nil)
+        return false
+    }
     func windowDidResignKey(_ notification: Notification) { if model.isActive { model.stop("控制面板失去焦点，已停止") } }
-    func windowDidMiniaturize(_ notification: Notification) { model.stop("窗口已最小化，升降已停止") }
+    func windowDidMiniaturize(_ notification: Notification) {
+        guard let sender = notification.object as? NSWindow, sender === window else { return }
+        model.stop("控制面板已最小化，升降已停止")
+    }
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool { showWindow(); return true }
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
         closeStatusMenu()
