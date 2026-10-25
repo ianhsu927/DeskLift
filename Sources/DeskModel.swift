@@ -27,6 +27,7 @@ final class DeskModel: NSObject, ObservableObject, CBCentralManagerDelegate, CBP
     @Published var detail = "按住 DPI1C 底部连接键约 2 秒，然后搜索桌子。"
     @Published var scanning = false
     @Published var connecting = false
+    @Published private(set) var autoConnectEnabled: Bool
     @Published var ready = false
     @Published var deskName = "你的升降桌"
     @Published var rawHeight: Int?
@@ -100,6 +101,10 @@ final class DeskModel: NSObject, ObservableObject, CBCentralManagerDelegate, CBP
     private var cooldownUntil = 0.0
     private var observers: [NSObjectProtocol] = []
     private let preview: Bool
+    private let connectionPreferences: DeskConnectionPreferences
+    private var startupConnection = StartupConnectionAttempt()
+    private var manualScanRequested = false
+    private var automaticConnectionID: UUID?
     private let clock = { ProcessInfo.processInfo.systemUptime }
     var height: Double? {
         guard !controllerMemoryRequiresReconnect, let rawHeight, let baseHeight else { return nil }
@@ -144,9 +149,12 @@ final class DeskModel: NSObject, ObservableObject, CBCentralManagerDelegate, CBP
         guard let b = baseHeight else { return "等待读取桌子高度" }
         return String(format: "本版本支持范围 %.1f–%.1f cm；桌子自身限位仍然生效", b, b + 65)
     }
-    init(preview: Bool = false, memoryVerificationOnly: Bool = false) {
+    init(preview: Bool = false, memoryVerificationOnly: Bool = false,
+         connectionPreferences: DeskConnectionPreferences = DeskConnectionPreferences()) {
         self.preview = preview
         self.memoryVerificationOnly = memoryVerificationOnly
+        self.connectionPreferences = connectionPreferences
+        self.autoConnectEnabled = connectionPreferences.autoConnectEnabled
         super.init()
         if preview {
             status = "界面预览 · 未连接硬件"
@@ -168,26 +176,73 @@ final class DeskModel: NSObject, ObservableObject, CBCentralManagerDelegate, CBP
         logs.append("\(f.string(from: Date()))  \(text)")
         if logs.count > 250 { logs.removeFirst(logs.count - 250) }
     }
+    func startAutomaticConnection() {
+        guard startupConnection.begin(enabled: autoConnectEnabled, rememberedDesk: connectionPreferences.lastDesk,
+                                      preview: preview, verificationOnly: memoryVerificationOnly) else { return }
+        guard let target = startupConnection.target else { return }
+        deskName = target.name
+        status = "正在准备自动连接"
+        detail = "等待读取上次使用的升降桌。"
+        if central == nil {
+            central = CBCentralManager(delegate: self, queue: .main, options: [CBCentralManagerOptionShowPowerAlertKey: true])
+        } else if central.state == .poweredOn {
+            attemptStartupConnection()
+        } else { updateBluetoothState() }
+    }
+    func setAutoConnectEnabled(_ enabled: Bool) {
+        autoConnectEnabled = enabled
+        connectionPreferences.autoConnectEnabled = enabled
+        if !enabled {
+            let pending = startupConnection.target != nil || automaticConnectionID != nil
+            startupConnection.cancel()
+            if pending { disconnect() }
+        }
+    }
+    private func attemptStartupConnection() {
+        guard let target = startupConnection.target, central.state == .poweredOn,
+              !connecting, peripheral == nil else { return }
+        // A cached identifier is a candidate only: the normal service,
+        // characteristic, calibration and live-height checks still run.
+        if let saved = central.retrievePeripherals(withIdentifiers: [target.id]).first {
+            guard startupConnection.consume(id: saved.identifier) else { return }
+            beginConnection(saved, name: target.name, automatic: true)
+        } else {
+            beginScan()
+            status = "正在寻找上次的桌子"
+            detail = "仅自动连接 \(target.name)。"
+        }
+    }
     func scan() {
         guard !memoryVerificationOnly || !memoryReadQuarantined else {
             detail = "只读验证会话已结束，请退出并重新打开应用后再连接。"
             return
         }
-        guard !preview, !connecting, peripheral == nil else { return }
+        guard !preview else { return }
+        if automaticConnectionID != nil { disconnect() }
+        guard !connecting, peripheral == nil else { return }
+        startupConnection.cancel()
+        manualScanRequested = true
         if central == nil {
             central = CBCentralManager(delegate: self, queue: .main, options: [CBCentralManagerOptionShowPowerAlertKey: true])
             return
         }
         guard central.state == .poweredOn else { updateBluetoothState(); return }
+        beginScan()
+    }
+    private func beginScan() {
+        manualScanRequested = false
         devices = []; peripherals = [:]
         scanning = true; status = "正在搜索"; detail = "保持桌子处于配对状态，并关闭其他占用连接的应用。"
         // Scan all services: some firmware advertises only the name while pairing.
         central.scanForPeripherals(withServices: nil, options: [CBCentralManagerScanOptionAllowDuplicatesKey: true])
         log("开始搜索附近 LINAK / DESK 蓝牙广播（20 秒）")
         scanTimeout?.invalidate()
-        scanTimeout = Timer.scheduledTimer(withTimeInterval: 20, repeats: false) { [weak self] _ in self?.endScan() }
+        scanTimeout = Timer(timeInterval: 20, repeats: false) { [weak self] _ in self?.endScan() }
+        RunLoop.main.add(scanTimeout!, forMode: .common)
     }
     func endScan() {
+        startupConnection.cancel()
+        manualScanRequested = false
         central?.stopScan(); scanTimeout?.invalidate(); scanning = false
         if peripheral == nil {
             status = devices.isEmpty ? "未发现桌子" : "请选择桌子"
@@ -197,9 +252,13 @@ final class DeskModel: NSObject, ObservableObject, CBCentralManagerDelegate, CBP
     func centralManagerDidUpdateState(_ central: CBCentralManager) {
         if central.state == .poweredOn {
             log("蓝牙已开启 · 授权 \(CBManager.authorization.rawValue)")
-            if peripheral == nil { scan() }
+            if startupConnection.target != nil { attemptStartupConnection() }
+            else if manualScanRequested, peripheral == nil, !connecting { beginScan() }
         }
         else {
+            if central.state == .poweredOff || central.state == .unauthorized || central.state == .unsupported {
+                startupConnection.cancel(); manualScanRequested = false
+            }
             clearSession()
             updateBluetoothState()
         }
@@ -218,12 +277,13 @@ final class DeskModel: NSObject, ObservableObject, CBCentralManagerDelegate, CBP
         log("\(status) · 蓝牙状态 \(central?.state.rawValue ?? -1) · 授权 \(CBManager.authorization.rawValue)")
     }
     func centralManager(_ central: CBCentralManager, didDiscover p: CBPeripheral, advertisementData a: [String: Any], rssi: NSNumber) {
+        guard scanning else { return }
         let name = (a[CBAdvertisementDataLocalNameKey] as? String) ?? p.name ?? ""
         let services = a[CBAdvertisementDataServiceUUIDsKey] as? [CBUUID] ?? []
         let manufacturer = a[CBAdvertisementDataManufacturerDataKey] as? Data
         let maker = manufacturer.map { Array($0.prefix(2)) == [0xa4, 0x00] } ?? false
         let upper = name.uppercased()
-        guard upper.contains("DESK") || upper.contains("LINAK") || maker || services.contains(CBUUID(string: DPI.service)) else { return }
+        guard startupConnection.target?.id == p.identifier || upper.contains("DESK") || upper.contains("LINAK") || maker || services.contains(CBUUID(string: DPI.service)) else { return }
         peripherals[p.identifier] = p
         let connectable = (a[CBAdvertisementDataIsConnectable] as? NSNumber)?.boolValue ?? true
         let d = NearbyDesk(id: p.identifier, name: name.isEmpty ? "LINAK 蓝牙设备" : name, rssi: rssi.intValue, connectable: connectable)
@@ -232,26 +292,40 @@ final class DeskModel: NSObject, ObservableObject, CBCentralManagerDelegate, CBP
             devices[i] = d
         }
         else { devices.append(d); log("发现 \(d.name) · 可连接：\(connectable)") }
+        if connectable, startupConnection.consume(id: p.identifier) {
+            beginConnection(p, name: d.name, automatic: true)
+        }
     }
     func connect(_ id: UUID) {
+        startupConnection.cancel()
+        manualScanRequested = false
+        if automaticConnectionID != nil { disconnect() }
         guard !memoryVerificationOnly || !memoryReadQuarantined else {
             detail = "只读验证会话已结束，请退出并重新打开应用后再连接。"
             return
         }
         guard !connecting, peripheral == nil, let p = peripherals[id], devices.first(where: { $0.id == id })?.connectable == true else { return }
+        beginConnection(p, name: devices.first(where: { $0.id == id })?.name ?? "LINAK 桌子", automatic: false)
+    }
+    private func beginConnection(_ p: CBPeripheral, name: String, automatic: Bool) {
+        guard !preview, !connecting, peripheral == nil else { return }
+        let id = p.identifier
         endScan(); clearSession(); peripheral = p; p.delegate = self
+        automaticConnectionID = automatic ? id : nil
         controllerMemoryNamingDeviceID = id
         controllerMemoryCustomNames = controllerMemoryNameStore.names(for: id)
-        connecting = true; deskName = devices.first(where: { $0.id == id })?.name ?? "LINAK 桌子"
-        status = "正在连接"; detail = "如 macOS 提示蓝牙配对，请在系统提示中完成配对。"
+        connecting = true; deskName = name
+        status = automatic ? "正在自动连接" : "正在连接"
+        detail = "如 macOS 提示蓝牙配对，请在系统提示中完成配对。"
         presets = (UserDefaults.standard.array(forKey: "presets.\(id)") as? [Int] ?? [-1, -1]).prefix(2).map { $0 < 0 ? nil : $0 }
         while presets.count < 2 { presets.append(nil) }
         central.connect(p, options: nil)
         log("连接 \(deskName) · 系统设备状态 \(p.state.rawValue)")
-        connectTimeout = Timer.scheduledTimer(withTimeInterval: 30, repeats: false) { [weak self] _ in
+        connectTimeout = Timer(timeInterval: 30, repeats: false) { [weak self] _ in
             guard let self, !self.ready else { return }
             self.fail("连接或读取超时；请重新进入配对模式，并退出手机上的连接。")
         }
+        RunLoop.main.add(connectTimeout!, forMode: .common)
     }
     func centralManager(_ central: CBCentralManager, didConnect p: CBPeripheral) {
         guard p == peripheral else { return }
@@ -323,8 +397,12 @@ final class DeskModel: NSObject, ObservableObject, CBCentralManagerDelegate, CBP
         } else if id == DPI.config {
             guard receiveControllerConfiguration(data) else { return }
         }
-        if !ready, height != nil {
+        if !ready, height != nil, clock() - lastFeedback <= 1.5 {
             ready = true; connecting = false; connectTimeout?.invalidate()
+            automaticConnectionID = nil
+            if !preview && !memoryVerificationOnly && p.state == .connected {
+                connectionPreferences.remember(RememberedDesk(id: p.identifier, name: deskName))
+            }
             status = "已连接"
             detail = memoryVerificationOnly ? "只读验证模式，升降与保存已禁用。请打开连接诊断，读取控制器记忆。" : "按住按钮升降，松开即停止。首次使用请小幅测试。"
             targetText = heightText
@@ -876,9 +954,21 @@ final class DeskModel: NSObject, ObservableObject, CBCentralManagerDelegate, CBP
         detail = "只读验证已结束。运动保持禁用；退出并正常重开后才能恢复控制。"
     }
     func disconnect() {
+        startupConnection.cancel()
+        manualScanRequested = false
         endScan()
         let p = peripheral
+        let hadActiveSession = ready || motion != nil
         stop("正在断开连接")
+        guard p != nil else {
+            clearSession(); status = "尚未连接"; detail = "点击搜索桌子重新连接。"
+            return
+        }
+        if !hadActiveSession {
+            if let p { central?.cancelPeripheralConnection(p) }
+            clearSession(); status = "尚未连接"; detail = "点击搜索桌子重新连接。"
+            return
+        }
         // Allow the final stop packet to leave before closing the BLE link.
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) { [weak self] in
             guard let self, self.peripheral == p else { return }
@@ -887,6 +977,8 @@ final class DeskModel: NSObject, ObservableObject, CBCentralManagerDelegate, CBP
         }
     }
     private func fail(_ message: String) {
+        startupConnection.cancel()
+        manualScanRequested = false
         log(message); stop(message)
         if let p = peripheral { central?.cancelPeripheralConnection(p) }
         clearSession(); status = "暂时无法连接"; detail = message
@@ -912,6 +1004,7 @@ final class DeskModel: NSObject, ObservableObject, CBCentralManagerDelegate, CBP
         tick?.invalidate(); tick = nil; connectTimeout?.invalidate()
         scanTimeout?.invalidate(); central?.stopScan(); scanning = false
         connecting = false; ready = false; motion = nil; motionID = nil; activeTarget = nil
+        automaticConnectionID = nil
         rawHeight = nil; baseHeight = nil; speed = 0; lastFeedback = -.infinity
         chars = [:]; notified = []; peripheral = nil; stopPending = false; presets = [nil, nil]
     }

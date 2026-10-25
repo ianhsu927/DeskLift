@@ -199,6 +199,14 @@ struct ConnectionView: View {
                 }
                 .buttonStyle(.borderedProminent)
             }
+            Divider()
+            Toggle("启动时自动连接", isOn: Binding(
+                get: { model.autoConnectEnabled },
+                set: { model.setAutoConnectEnabled($0) }
+            ))
+            .toggleStyle(.switch)
+            .controlSize(.small)
+            .disabled(model.memoryVerificationOnly)
         }.padding(20).frame(width: 320)
     }
 }
@@ -434,6 +442,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
             return event
         }
         NSApp.activate(ignoringOtherApps: true)
+        model.startAutomaticConnection()
     }
 
     private func configureStatusMenu() {
