@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: 'Existing stable version tag, for example v1.0.0'
+        description: 'Stable tag, e.g. v1.0.0; validation can use a new name, publishing requires an existing tag'
         required: true
         type: string
       publish:
@@ -27,6 +27,7 @@ concurrency:
 env:
   RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
   RELEASE_ARTIFACT: desklift-release-${{ github.run_id }}-${{ github.run_attempt }}
+  VALIDATION_ONLY: ${{ github.event_name == 'workflow_dispatch' && !inputs.publish }}
   DEVELOPER_DIR: /Applications/Xcode.app/Contents/Developer
   TZ: Asia/Shanghai
 
@@ -35,6 +36,8 @@ jobs:
     name: Test and package on Mac mini
     runs-on: [self-hosted, macOS, ARM64, desklift-mini]
     timeout-minutes: 45
+    outputs:
+      commit: ${{ steps.source.outputs.commit }}
     steps:
       - name: Validate version tag
         shell: bash
@@ -45,19 +48,40 @@ jobs:
             exit 1
           fi
 
-      - name: Check out the tagged source
+      - name: Check out the selected ref
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: refs/tags/${{ env.RELEASE_TAG }}
+          ref: ${{ github.sha }}
           fetch-depth: 0
           persist-credentials: false
 
-      - name: Verify tag belongs to main
+      - name: Prepare tagged source
+        id: source
         shell: bash
         run: |
           set -euo pipefail
+          # Query GitHub rather than trusting a tag left by an earlier local-only validation.
+          if git ls-remote --exit-code --refs origin "refs/tags/$RELEASE_TAG" > /dev/null; then
+            git fetch --force --no-tags origin "refs/tags/$RELEASE_TAG:refs/tags/$RELEASE_TAG"
+            git checkout --detach "refs/tags/$RELEASE_TAG"
+          else
+            remote_status=$?
+            if [[ "$remote_status" != 2 || "$VALIDATION_ONLY" != true ]]; then
+              echo 'Publishing requires an existing remote tag; remote lookup failures also abort validation.' >&2
+              exit 1
+            fi
+            # A missing remote tag is allowed only for manual validation. It never leaves this checkout.
+            git checkout --detach "$GITHUB_SHA"
+            git tag --force "$RELEASE_TAG" "$GITHUB_SHA"
+          fi
           test "$(git rev-parse "refs/tags/$RELEASE_TAG^{commit}")" = "$(git rev-parse HEAD)"
-          git merge-base --is-ancestor HEAD refs/remotes/origin/main
+          if [[ "$GITHUB_EVENT_NAME" == push ]]; then
+            test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          fi
+          if [[ "$VALIDATION_ONLY" != true ]]; then
+            git merge-base --is-ancestor HEAD refs/remotes/origin/main
+          fi
+          echo "commit=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
 
       - name: Run tests and build release packages
         shell: bash
@@ -101,8 +125,12 @@ jobs:
       - name: Verify and publish packages
         env:
           GH_TOKEN: ${{ github.token }}
+          RELEASE_COMMIT: ${{ needs.build.outputs.commit }}
         run: |
           set -euo pipefail
+          # Refuse a tag that moved while the Mac was building its packages.
+          remote_commit=$(gh api "repos/$GITHUB_REPOSITORY/commits/refs/tags/$RELEASE_TAG" --jq .sha)
+          test "$remote_commit" = "$RELEASE_COMMIT"
           cd release
           sha256sum --check SHA256SUMS.txt
           shopt -s nullglob

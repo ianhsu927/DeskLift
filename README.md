@@ -41,7 +41,13 @@ git tag -a v1.0.0 -m 'DeskLift 1.0.0'
 git push origin v1.0.0
 ```
 
-上述版本号仅为示例，每次发布使用一个新标签。应用版本自动取自标签，构建号取自 GitHub Actions 的运行编号；日常本机构建继续使用工程中的默认版本。Actions 的「Release DeskLift → Run workflow」也可以针对已有主线标签手动验证，默认不发布；勾选 `publish` 才会创建 Release。已有 Release 的附件不会被覆盖。
+上述版本号仅为示例，每次发布使用一个新标签。应用版本自动取自标签，构建号取自 GitHub Actions 的运行编号；日常本机构建继续使用工程中的默认版本。Actions 的「Release DeskLift → Run workflow」默认只验证，可以选择开发分支并填写尚未创建的版本标签名；流程只在 runner 的 checkout 内创建临时标签，不推送标签或创建 Release。勾选 `publish` 后，则必须指定远端已有且属于 `main` 的标签。已有 Release 的附件不会被覆盖。
+
+例如，以下命令验证发布流程并上传测试产物，不发布版本：
+
+```sh
+gh workflow run release.yml --ref main -f tag=v0.0.0 -F publish=false
+```
 
 Release 包含：
 
@@ -54,6 +60,8 @@ Release 包含：
 编译和测试使用开发 Mac mini 上的仓库专用 self-hosted runner，标签为 `self-hosted`、`macOS`、`ARM64`、`desklift-mini`。机器需要安装 `/Applications/Xcode.app`，并在 Xcode 中完成首次启动设置。runner 使用独立工作目录，不能将其 `_work` 指向原始开发 checkout；它只处理版本发布和手动运行，不执行 PR 工作流。发布附件由 GitHub 托管的 Ubuntu job 上传，Mac mini 上的构建 job 仅持有仓库读取权限。
 
 Mac mini 必须在线且 runner 正在运行。若以 LaunchAgent 方式安装，用户需保持登录。产物在本次 checkout 的 `deliverables/<标签>/` 中，并自动保留恢复副本到 `~/Library/Application Support/DeskLift/releases/<标签>/<时间戳>-<运行ID>-<重试次数>/`；源码和构建缓存留在原 Mac，缓存不进入发布附件。可通过 `DESKLIFT_RELEASE_ARCHIVE_DIR` 调整恢复副本的根目录。
+
+当前专用 runner 安装目录为 `~/.local/share/desklift-actions-runner`，可在该目录执行 `./svc.sh status` 查看服务状态、`./svc.sh start` 启动服务。打包失败时，中间文件保留在 `deliverables/.<标签>.<随机值>/`，修复后可直接重试；成功产物不会被覆盖。
 
 在开发 Mac mini 上也可以对当前提交的已有标签仅生成本机发布包：
 
