@@ -30,6 +30,39 @@ open build/DeskLift.app
 
 也可以打开 `DeskLift.xcodeproj`，选择共享的 `DeskLift` scheme。Xcode 默认启用 `--preview` 参数，使用预览数据；连接真实设备前，请在 Scheme → Run → Arguments 中关闭该参数。
 
+## 自动发布
+
+推送稳定版本标签（`v主版本.次版本.补丁版本`，例如 `v1.0.0`）后，GitHub Actions 自动执行完整测试、构建 arm64 应用、打包，并创建同名 GitHub Release。标签必须指向已进入 `main` 的提交。发布流程不启动应用、不连接蓝牙，也不会驱动升降桌。
+
+```sh
+git switch main
+git pull --ff-only
+git tag -a v1.0.0 -m 'DeskLift 1.0.0'
+git push origin v1.0.0
+```
+
+上述版本号仅为示例，每次发布使用一个新标签。应用版本自动取自标签，构建号取自 GitHub Actions 的运行编号；日常本机构建继续使用工程中的默认版本。Actions 的「Release DeskLift → Run workflow」也可以针对已有主线标签手动验证，默认不发布；勾选 `publish` 才会创建 Release。已有 Release 的附件不会被覆盖。
+
+Release 包含：
+
+- `DeskLift-vX.Y.Z-macos-arm64.zip`：应用、README 和第三方声明，最低 macOS 14。
+- `DeskLift-vX.Y.Z-source.tar.gz`：对应提交的源码、测试、脚本、资源和第三方声明。
+- `SHA256SUMS.txt`：以上两个下载文件的 SHA-256 校验值。
+
+下载到同一目录后，可执行 `shasum -a 256 -c SHA256SUMS.txt` 校验文件。自动发布采用临时签名，尚未接入 Developer ID 签名和 Apple 公证；Siri / 快捷指令的签名要求见下文。
+
+编译和测试使用开发 Mac mini 上的仓库专用 self-hosted runner，标签为 `self-hosted`、`macOS`、`ARM64`、`desklift-mini`。机器需要安装 `/Applications/Xcode.app`，并在 Xcode 中完成首次启动设置。runner 使用独立工作目录，不能将其 `_work` 指向原始开发 checkout；它只处理版本发布和手动运行，不执行 PR 工作流。发布附件由 GitHub 托管的 Ubuntu job 上传，Mac mini 上的构建 job 仅持有仓库读取权限。
+
+Mac mini 必须在线且 runner 正在运行。若以 LaunchAgent 方式安装，用户需保持登录。产物在本次 checkout 的 `deliverables/<标签>/` 中，并自动保留恢复副本到 `~/Library/Application Support/DeskLift/releases/<标签>/<时间戳>-<运行ID>-<重试次数>/`；源码和构建缓存留在原 Mac，缓存不进入发布附件。可通过 `DESKLIFT_RELEASE_ARCHIVE_DIR` 调整恢复副本的根目录。
+
+在开发 Mac mini 上也可以对当前提交的已有标签仅生成本机发布包：
+
+```sh
+./scripts/release.sh v1.0.0
+```
+
+此命令要求工作区干净、标签指向当前提交，执行完整测试和构建后保留产物，不上传 GitHub。已有输出目录会被保留并阻止覆盖。
+
 ## 测试
 
 ```sh

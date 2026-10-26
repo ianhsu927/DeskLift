@@ -1,0 +1,122 @@
+name: Release DeskLift
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Existing stable version tag, for example v1.0.0'
+        required: true
+        type: string
+      publish:
+        description: 'Publish a GitHub Release after validation and packaging'
+        required: true
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+# Serialize release builds on the development Mac and publication for this repo.
+concurrency:
+  group: desklift-release
+  cancel-in-progress: false
+
+env:
+  RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+  RELEASE_ARTIFACT: desklift-release-${{ github.run_id }}-${{ github.run_attempt }}
+  DEVELOPER_DIR: /Applications/Xcode.app/Contents/Developer
+  TZ: Asia/Shanghai
+
+jobs:
+  build:
+    name: Test and package on Mac mini
+    runs-on: [self-hosted, macOS, ARM64, desklift-mini]
+    timeout-minutes: 45
+    steps:
+      - name: Validate version tag
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ ! "$RELEASE_TAG" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+            echo 'Expected a stable version tag such as v1.0.0, without leading zeros.' >&2
+            exit 1
+          fi
+
+      - name: Check out the tagged source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: refs/tags/${{ env.RELEASE_TAG }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Verify tag belongs to main
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse "refs/tags/$RELEASE_TAG^{commit}")" = "$(git rev-parse HEAD)"
+          git merge-base --is-ancestor HEAD refs/remotes/origin/main
+
+      - name: Run tests and build release packages
+        shell: bash
+        run: ./scripts/release.sh "$RELEASE_TAG"
+
+      # Only final packages leave this Mac. Build products and module caches stay local.
+      - name: Upload release packages
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ${{ env.RELEASE_ARTIFACT }}
+          path: |
+            deliverables/${{ env.RELEASE_TAG }}/DeskLift-${{ env.RELEASE_TAG }}-macos-arm64.zip
+            deliverables/${{ env.RELEASE_TAG }}/DeskLift-${{ env.RELEASE_TAG }}-source.tar.gz
+            deliverables/${{ env.RELEASE_TAG }}/SHA256SUMS.txt
+            deliverables/${{ env.RELEASE_TAG }}/release-notes-*.md
+          if-no-files-found: error
+          retention-days: 14
+          compression-level: 0
+
+  publish:
+    name: Publish GitHub Release
+    needs: build
+    if: github.event_name == 'push' || inputs.publish
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    # The build on the home Mac never receives a token that can write the repository.
+    permissions:
+      actions: read
+      contents: write
+    steps:
+      - name: Download this run's packages
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh run download "$GITHUB_RUN_ID" \
+            --repo "$GITHUB_REPOSITORY" \
+            --name "$RELEASE_ARTIFACT" \
+            --dir release
+
+      - name: Verify and publish packages
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          cd release
+          sha256sum --check SHA256SUMS.txt
+          shopt -s nullglob
+          notes=(release-notes-*.md)
+          if (( ${#notes[@]} != 1 )); then
+            echo 'Expected exactly one release notes document.' >&2
+            exit 1
+          fi
+          # Creation fails for an existing release; published assets are never overwritten.
+          gh release create "$RELEASE_TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --verify-tag \
+            --title "DeskLift $RELEASE_TAG" \
+            --notes-file "${notes[0]}" \
+            "DeskLift-$RELEASE_TAG-macos-arm64.zip" \
+            "DeskLift-$RELEASE_TAG-source.tar.gz" \
+            SHA256SUMS.txt
